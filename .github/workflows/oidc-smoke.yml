@@ -1,0 +1,54 @@
+name: OIDC Login Smoke Test
+on:
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  oidc-login:
+    runs-on: [self-hosted, azure, linux, x64, aci]
+
+    steps:
+      - name: Prove passwordless OIDC federation to Azure
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          SCOPE_RG: ghrunner-rg
+        run: |
+          set -euo pipefail
+          echo "::group::Get GitHub OIDC token"
+          AUTH_HEADER="Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}"
+          GH_JWT=$(curl -sS -H "$AUTH_HEADER" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | jq -r '.value')
+          echo "::add-mask::$GH_JWT"
+          [ -n "$GH_JWT" ] && [ "$GH_JWT" != "null" ] || { echo "no OIDC token (need id-token: write)"; exit 1; }
+          echo "subject: $(echo "$GH_JWT" | cut -d. -f2 | base64 -d 2>/dev/null | jq -r '.sub')"
+          echo "::endgroup::"
+
+          echo "::group::Exchange for an Azure ARM access token (federation test)"
+          RESP=$(curl -sS -X POST \
+            "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+            -d "client_id=${AZURE_CLIENT_ID}" \
+            -d "scope=https://management.azure.com/.default" \
+            -d "grant_type=client_credentials" \
+            -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+            --data-urlencode "client_assertion=${GH_JWT}")
+          ARM_AT=$(echo "$RESP" | jq -r '.access_token // empty')
+          echo "::add-mask::$ARM_AT"
+          if [ -z "$ARM_AT" ]; then
+            echo "Federation FAILED:"; echo "$RESP" | jq -r '.error_description // .' | head -3; exit 1
+          fi
+          echo "Azure access token obtained — passwordless federation OK."
+          echo "::endgroup::"
+
+          echo "::group::Use the token via ARM REST (proves the role assignment)"
+          AUTH_SCHEME=Bearer
+          CODE=$(curl -sS -o /tmp/rg.json -w '%{http_code}' \
+            -H "Authorization: ${AUTH_SCHEME} ${ARM_AT}" \
+            "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourcegroups/${SCOPE_RG}?api-version=2021-04-01")
+          echo "ARM GET resourceGroup -> HTTP $CODE"
+          [ "$CODE" = "200" ] && jq -r '.name + " @ " + .location' /tmp/rg.json || \
+            { echo "role not effective yet (HTTP $CODE)"; cat /tmp/rg.json; exit 1; }
+          echo "::endgroup::"
+          echo "OIDC passwordless login + role check OK"
